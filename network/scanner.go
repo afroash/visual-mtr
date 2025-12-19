@@ -15,11 +15,13 @@ import (
 
 // Scanner manages the network path scanning operations
 type Scanner struct {
-	hostname string
-	hops     []NetworkHop
-	updates  chan HopUpdate
-	ctx      context.Context
-	cancel   context.CancelFunc
+	hostname   string
+	hops       []NetworkHop
+	updates    chan HopUpdate
+	ctx        context.Context
+	cancel     context.CancelFunc
+	conn       *icmp.PacketConn // Connection for ICMP operations
+	stopCalled bool             // Flag to prevent double-close of channel
 }
 
 // NewScanner creates a new scanner instance
@@ -40,106 +42,57 @@ func NewScanner(hostname string) *Scanner {
 // 2. Start continuous pinging of all hops in parallel
 // 3. Send updates via the Updates() channel
 func (s *Scanner) Start() error {
-	// TODO: Implement traceroute logic here
-	// This should populate s.hops with initial hop data
-	dstAddr, err := net.ResolveIPAddr("ip", s.hostname)
+	// Perform traceroute to discover all hops
+	hops, err := performTraceroute(s.hostname)
 	if err != nil {
 		return err
 	}
 
+	// Store the discovered hops
+	s.hops = hops
+
+	// Create ICMP connection for continuous monitoring
 	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create ICMP connection for monitoring: %v", err)
+	}
+	s.conn = conn
+
+	log.Printf("[DEBUG] Traceroute discovered %d hops, starting monitor loop\n", len(s.hops))
+
+	// Start the monitoring loop if we have hops
+	if len(s.hops) > 0 {
+		log.Printf("[DEBUG] Starting monitor loop for continuous ping updates\n")
+		go s.monitorLoop()
 	}
 
-	defer conn.Close()
+	return nil
+}
 
-	fmt.Printf("Starting traceroute to: %s on IP: %s\n", s.hostname, dstAddr.IP.String())
-
-	for ttl := 1; ttl <= 30; ttl++ {
-		startTime := time.Now()
-
-		// Set TTL
-		if err := conn.IPv4PacketConn().SetTTL(ttl); err != nil {
-			log.Fatalf("Failed to set TTL: %v", err)
-		}
-
-		// Create ICMP Message. Type will be Echo Request
-		msg := icmp.Message{
-			Type: ipv4.ICMPTypeEcho,
-			Code: 0,
-			Body: &icmp.Echo{
-				ID:   os.Getpid() % 0xFFFF,
-				Seq:  ttl,
-				Data: []byte("HELLO-TRACEROUTE"),
-			},
-		}
-
-		// Marshal the message
-		msgBytes, err := msg.Marshal(nil)
-		if err != nil {
-			log.Fatalf("Failed to marshal message: %v", err)
-		}
-
-		// Send the message
-		if _, err := conn.WriteTo(msgBytes, dstAddr); err != nil {
-			log.Fatalf("Failed to send message: %v", err)
-		}
-
-		// Receive the response
-		buf := make([]byte, 1500) // MTU size
-		if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
-			log.Fatalf("SetReadDeadline failed: %s", err)
-		}
-
-		n, peerAddr, err := conn.ReadFrom(buf)
-		if err != nil {
-			fmt.Printf("%d\t*\t*\t*\n", ttl) // Timeout
-			continue
-		}
-
-		elapsed := time.Since(startTime)
-
-		// Unmarshal the response
-		recvMsg, err := icmp.ParseMessage(1, buf[:n]) // 1 for ICMPv4
-		if err != nil {
-			log.Fatalf("Failed to parse response: %v", err)
-		}
-
-		// Handle the response and add to hops
-		switch recvMsg.Type {
-		case ipv4.ICMPTypeEchoReply:
-			if recvMsg.Body.(*icmp.Echo).ID != os.Getpid()%0xFFFF {
-				continue // Not our message
-			}
-
-			reply := recvMsg.Body.(*icmp.Echo)
-			fmt.Printf("%d\t%s\t%d\t%.2fms\n", ttl, peerAddr.String(), reply.Seq, elapsed.Seconds()*1000)
-			s.hops = append(s.hops, NetworkHop{IP: dstAddr.IP.String(), AvgLatency: elapsed.Seconds() * 1000, LossPercent: 0})
-			return nil
-
-		case ipv4.ICMPTypeTimeExceeded:
-			// For simplicity, we assume any TimeExceeded message is for our probe.
-			// A robust implementation would parse the body of the message
-			// to verify the ID of the original packet. TODO: Implement this Later. For now, we assume any TimeExceeded message is for our probe.
-			//fmt.Printf("%d\t%s\t%d\t%.2fms\n", ttl, dstAddr.IP.String(), recvMsg.Body.(*icmp.TimeExceeded).Record[0].Seq, elapsed.Seconds()*1000)
-			//fmt.Printf("%d\t%s\t%d\t%.2fms\n", ttl, dstAddr.IP.String(), reply.Seq, elapsed.Seconds()*1000)
-
-			s.hops = append(s.hops, NetworkHop{IP: peerAddr.String(), AvgLatency: elapsed.Seconds() * 1000, LossPercent: 0})
-			return nil
-		default:
-			fmt.Printf("%d\t*\t*\t*\n", ttl) // Unknown type
-			continue
-		}
+// extractIPFromAddr extracts the IP address from a net.Addr
+// Handles both "ip:port" format and plain IP addresses
+func extractIPFromAddr(addr net.Addr) string {
+	addrStr := addr.String()
+	host, _, err := net.SplitHostPort(addrStr)
+	if err != nil {
+		// If SplitHostPort fails, assume it's just an IP address
+		return addrStr
 	}
-
-	return nil // Success
+	return host
 }
 
 // Stop halts the scanning process
 func (s *Scanner) Stop() {
 	s.cancel()
-	close(s.updates)
+	if s.conn != nil {
+		s.conn.Close()
+		s.conn = nil
+	}
+	// Safely close the updates channel (only once)
+	if !s.stopCalled {
+		s.stopCalled = true
+		close(s.updates)
+	}
 }
 
 // Updates returns the channel that emits hop updates
@@ -191,13 +144,122 @@ func (s *Scanner) pingAllHops() {
 }
 
 // performTraceroute performs a traceroute to the target hostname
-// TODO: Implement actual traceroute logic here
-// This should return a slice of NetworkHop with IP addresses populated
+// Returns a slice of NetworkHop with IP addresses populated
 func performTraceroute(hostname string) ([]NetworkHop, error) {
-	// TODO: Implement traceroute using ICMP or UDP packets
-	// Return a slice of NetworkHop structs with IP addresses set
-	// Latency and LossPercent can be initialized to 0
+	// Resolve the hostname to an IP address
+	dstAddr, err := net.ResolveIPAddr("ip", hostname)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve hostname: %v", err)
+	}
 
-	// Placeholder return
-	return []NetworkHop{}, nil
+	// Create a new ICMP connection
+	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+	if err != nil {
+
+		return nil, fmt.Errorf("failed to create ICMP connection: %v", err)
+	}
+	defer conn.Close()
+
+	fmt.Printf("Starting traceroute to: %s on IP: %s\n", hostname, dstAddr.IP.String())
+
+	// Local slice to collect hops
+	hops := make([]NetworkHop, 0)
+
+	// Perform traceroute
+	destinationReached := false
+	for ttl := 1; ttl <= 30; ttl++ {
+		startTime := time.Now()
+
+		log.Printf("[DEBUG] TTL=%d: Sending probe to %s\n", ttl, dstAddr.IP.String())
+
+		// Set TTL
+		if err := conn.IPv4PacketConn().SetTTL(ttl); err != nil {
+			log.Fatalf("Failed to set TTL: %v", err)
+		}
+
+		// Create ICMP Message. Type will be Echo Request
+		msg := icmp.Message{
+			Type: ipv4.ICMPTypeEcho,
+			Code: 0,
+			Body: &icmp.Echo{
+				ID:   os.Getpid() % 0xFFFF,
+				Seq:  ttl,
+				Data: []byte("HELLO-TRACEROUTE"),
+			},
+		}
+
+		// Marshal the message
+		msgBytes, err := msg.Marshal(nil)
+		if err != nil {
+			log.Fatalf("Failed to marshal message: %v", err)
+		}
+
+		// Send the message
+		if _, err := conn.WriteTo(msgBytes, dstAddr); err != nil {
+			log.Fatalf("Failed to send message: %v", err)
+		}
+		log.Printf("[DEBUG] TTL=%d: Sent ICMP Echo Request (ID=%d, Seq=%d)\n", ttl, msg.Body.(*icmp.Echo).ID, msg.Body.(*icmp.Echo).Seq)
+
+		// Receive the response
+		buf := make([]byte, 1500) // MTU size
+		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+
+		n, peerAddr, err := conn.ReadFrom(buf)
+		if err != nil {
+			fmt.Printf("%d\t*\t*\t*\n", ttl) // Timeout
+			log.Printf("[DEBUG] TTL=%d: Timeout (no response within 3 seconds)\n", ttl)
+			continue
+		}
+
+		elapsed := time.Since(startTime)
+		log.Printf("[DEBUG] TTL=%d: Received response from %s (%.2fms)\n", ttl, peerAddr.String(), elapsed.Seconds()*1000)
+
+		// Unmarshal the response
+		recvMsg, err := icmp.ParseMessage(1, buf[:n]) // 1 for ICMPv4
+		if err != nil {
+			log.Printf("[DEBUG] TTL=%d: Failed to parse response: %v\n", ttl, err)
+			continue
+		}
+		log.Printf("[DEBUG] TTL=%d: Parsed ICMP message type: %v\n", ttl, recvMsg.Type)
+
+		// Handle the response and add to hops
+		switch recvMsg.Type {
+		case ipv4.ICMPTypeEchoReply:
+			if recvMsg.Body.(*icmp.Echo).ID != os.Getpid()%0xFFFF {
+				log.Printf("[DEBUG] TTL=%d: Received EchoReply with wrong ID, ignoring\n", ttl)
+				continue // Not our message
+			}
+			reply := recvMsg.Body.(*icmp.Echo)
+			// Extract IP from peerAddr (format: "ip:port" or just "ip")
+			hopIP := extractIPFromAddr(peerAddr)
+			fmt.Printf("%d\t%s\t%d\t%.2fms\n", ttl, hopIP, reply.Seq, elapsed.Seconds()*1000)
+			hops = append(hops, NetworkHop{IP: hopIP, AvgLatency: elapsed.Seconds() * 1000, LossPercent: 0})
+			log.Printf("[DEBUG] Added final hop: IP=%s, Latency=%.2fms\n", hopIP, elapsed.Seconds()*1000)
+			// Destination reached, traceroute complete
+			destinationReached = true
+
+		case ipv4.ICMPTypeTimeExceeded:
+			// Extract IP from peerAddr (format: "ip:port" or just "ip")
+			hopIP := extractIPFromAddr(peerAddr)
+			fmt.Printf("%d\t%s\t%d\t%.2fms\n", ttl, hopIP, ttl, elapsed.Seconds()*1000)
+			hops = append(hops, NetworkHop{IP: hopIP, AvgLatency: elapsed.Seconds() * 1000, LossPercent: 0})
+			log.Printf("[DEBUG] TTL=%d: Received TimeExceeded from %s (%.2fms)\n", ttl, hopIP, elapsed.Seconds()*1000)
+			log.Printf("[DEBUG] Added hop: IP=%s, Latency=%.2fms\n", hopIP, elapsed.Seconds()*1000)
+			// Continue to next TTL
+			continue
+		default:
+			fmt.Printf("%d\t*\t*\t*\n", ttl) // Unknown type
+			log.Printf("[DEBUG] TTL=%d: Unknown ICMP type: %v\n", ttl, recvMsg.Type)
+			continue
+		}
+
+		// Break out of loop if destination reached
+		if destinationReached {
+			break
+		}
+	}
+
+	log.Printf("[DEBUG] Traceroute complete: %d hops discovered\n", len(hops))
+
+	return hops, nil
 }

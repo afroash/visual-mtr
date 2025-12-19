@@ -39,6 +39,8 @@ func NewVisualMTR() *VisualMTR {
 	}
 
 	vm.setupUI()
+	vm.setupMenu()
+	vm.setupCloseHandler()
 	return vm
 }
 
@@ -46,6 +48,8 @@ func (vm *VisualMTR) setupUI() {
 	// Top section: Hostname entry and buttons
 	vm.hostnameEntry = widget.NewEntry()
 	vm.hostnameEntry.SetPlaceHolder("Enter hostname or IP address (e.g., google.com)")
+	// Ensure entry is enabled and focusable
+	vm.hostnameEntry.Enable()
 
 	vm.startButton = widget.NewButton("Start", vm.onStart)
 	vm.stopButton = widget.NewButton("Stop", vm.onStop)
@@ -70,6 +74,41 @@ func (vm *VisualMTR) setupUI() {
 	// Main layout
 	content := container.NewBorder(topBar, nil, nil, nil, scrollContainer)
 	vm.window.SetContent(content)
+}
+
+// setupMenu creates the application menu with File/Quit option
+func (vm *VisualMTR) setupMenu() {
+	quitItem := fyne.NewMenuItem("Quit", func() {
+		vm.onQuit()
+	})
+
+	fileMenu := fyne.NewMenu("File", quitItem)
+	mainMenu := fyne.NewMainMenu(fileMenu)
+	vm.window.SetMainMenu(mainMenu)
+}
+
+// setupCloseHandler handles window close events
+func (vm *VisualMTR) setupCloseHandler() {
+	vm.window.SetCloseIntercept(func() {
+		vm.onQuit()
+	})
+}
+
+// onQuit handles application exit with proper cleanup
+func (vm *VisualMTR) onQuit() {
+	// Stop any running scanner
+	if vm.scanner != nil {
+		vm.hopsMutex.Lock()
+		scanner := vm.scanner
+		vm.scanner = nil
+		vm.hopsMutex.Unlock()
+
+		if scanner != nil {
+			scanner.Stop()
+		}
+	}
+	// Close the application
+	vm.app.Quit()
 }
 
 // Callback functions for the list widget
@@ -116,8 +155,10 @@ func (vm *VisualMTR) hopListUpdateItem(id widget.ListItemID, obj fyne.CanvasObje
 		return
 	}
 
-	objects := objectsField.Interface().([]fyne.CanvasObject)
-	if len(objects) < 5 {
+	// Safely convert to []fyne.CanvasObject with type assertion check
+	objectsInterface := objectsField.Interface()
+	objects, ok := objectsInterface.([]fyne.CanvasObject)
+	if !ok || len(objects) < 5 {
 		return
 	}
 
@@ -147,19 +188,31 @@ func (vm *VisualMTR) onStart() {
 		return
 	}
 
+	// Update UI state only after validation passes
 	vm.startButton.Disable()
 	vm.hostnameEntry.Disable()
 	vm.stopButton.Enable()
 
-	// Create new scanner
+	// Create new scanner with mutex protection
+	vm.hopsMutex.Lock()
 	vm.scanner = network.NewScanner(hostname)
+	scanner := vm.scanner
+	vm.hopsMutex.Unlock()
 
 	// Start scanning in background
 	go func() {
-		err := vm.scanner.Start()
+		err := scanner.Start()
 		if err != nil {
 			// TODO: Show error dialog
 			fmt.Printf("Error starting scanner: %v\n", err)
+			// Reset UI state on error
+			vm.startButton.Enable()
+			vm.hostnameEntry.Enable()
+			vm.stopButton.Disable()
+			// Clear scanner reference
+			vm.hopsMutex.Lock()
+			vm.scanner = nil
+			vm.hopsMutex.Unlock()
 			return
 		}
 	}()
@@ -169,9 +222,14 @@ func (vm *VisualMTR) onStart() {
 }
 
 func (vm *VisualMTR) onStop() {
-	if vm.scanner != nil {
-		vm.scanner.Stop()
-		vm.scanner = nil
+	// Safely stop scanner with mutex protection
+	vm.hopsMutex.Lock()
+	scanner := vm.scanner
+	vm.scanner = nil
+	vm.hopsMutex.Unlock()
+
+	if scanner != nil {
+		scanner.Stop()
 	}
 
 	vm.startButton.Enable()
@@ -190,7 +248,17 @@ func (vm *VisualMTR) onStop() {
 // handleUpdates processes hop updates from the scanner and updates the UI
 // This runs in a background goroutine and uses Fyne's thread-safe UI update mechanism
 func (vm *VisualMTR) handleUpdates() {
-	updates := vm.scanner.Updates()
+	// Safely get scanner reference to avoid nil pointer dereference
+	// Use a local variable to hold the scanner while we get the updates channel
+	vm.hopsMutex.RLock()
+	scanner := vm.scanner
+	vm.hopsMutex.RUnlock()
+
+	if scanner == nil {
+		return
+	}
+
+	updates := scanner.Updates()
 
 	for update := range updates {
 		vm.hopsMutex.Lock()
