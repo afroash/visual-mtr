@@ -63,16 +63,37 @@ func (vm *VisualMTR) setupUI() {
 	vm.hopList = widget.NewList(
 		vm.hopListLength,
 		vm.hopListCreateItem,
-		vm.
-			hopListUpdateItem,
+		vm.hopListUpdateItem,
 	)
+
+	// Create header row for table
+	header := container.NewHBox(
+		widget.NewLabel("Hop#"),
+		widget.NewLabel("  "),
+		widget.NewLabel("IP Address"),
+		widget.NewLabel("  "),
+		widget.NewLabel("Latency"),
+		widget.NewLabel("  "),
+		widget.NewLabel("Loss"),
+		widget.NewLabel("  "),
+		widget.NewLabel("Status"),
+	)
+	headerTextStyle := fyne.TextStyle{Bold: true}
+	for _, obj := range header.Objects {
+		if label, ok := obj.(*widget.Label); ok {
+			label.TextStyle = headerTextStyle
+		}
+	}
 
 	// Scrollable container for hop data
 	scrollContainer := container.NewScroll(vm.hopList)
 	scrollContainer.SetMinSize(fyne.NewSize(0, 400))
 
+	// Combine header and scrollable list
+	listWithHeader := container.NewBorder(header, nil, nil, nil, scrollContainer)
+
 	// Main layout
-	content := container.NewBorder(topBar, nil, nil, nil, scrollContainer)
+	content := container.NewBorder(topBar, nil, nil, nil, listWithHeader)
 	vm.window.SetContent(content)
 }
 
@@ -119,20 +140,29 @@ func (vm *VisualMTR) hopListLength() int {
 }
 
 func (vm *VisualMTR) hopListCreateItem() fyne.CanvasObject {
-	// Create a container with IP, Latency, and Loss labels
+	// Create table-like layout with 5 columns: Hop#, IP, Latency, Loss, Status
+	hopNumLabel := widget.NewLabel("")
+	hopNumLabel.TextStyle = fyne.TextStyle{Bold: true}
+
 	ipLabel := widget.NewLabel("")
 	ipLabel.TextStyle = fyne.TextStyle{Bold: true}
 
 	latencyLabel := widget.NewLabel("")
 	lossLabel := widget.NewLabel("")
+	statusLabel := widget.NewLabel("")
 
-	// Use HBox for layout - structure: [ipLabel, "Latency:", latencyLabel, "Loss:", lossLabel]
+	// Use HBox with proper spacing for table-like appearance
+	// Structure: [Hop#, IP, Latency, Loss, Status]
 	return container.NewHBox(
+		hopNumLabel,
+		widget.NewLabel("  "), // Spacer
 		ipLabel,
-		widget.NewLabel("Latency:"),
+		widget.NewLabel("  "), // Spacer
 		latencyLabel,
-		widget.NewLabel("Loss:"),
+		widget.NewLabel("  "), // Spacer
 		lossLabel,
+		widget.NewLabel("  "), // Spacer
+		statusLabel,
 	)
 }
 
@@ -158,27 +188,51 @@ func (vm *VisualMTR) hopListUpdateItem(id widget.ListItemID, obj fyne.CanvasObje
 	// Safely convert to []fyne.CanvasObject with type assertion check
 	objectsInterface := objectsField.Interface()
 	objects, ok := objectsInterface.([]fyne.CanvasObject)
-	if !ok || len(objects) < 5 {
+	if !ok || len(objects) < 9 {
 		return
 	}
 
-	ipLabel := objects[0].(*widget.Label)
-	ipLabel.SetText(fmt.Sprintf("Hop %d: %s", id+1, hop.IP))
+	// Objects structure: [hopNumLabel, spacer, ipLabel, spacer, latencyLabel, spacer, lossLabel, spacer, statusLabel]
+	hopNumLabel := objects[0].(*widget.Label)
+	ipLabel := objects[2].(*widget.Label)
+	latencyLabel := objects[4].(*widget.Label)
+	lossLabel := objects[6].(*widget.Label)
+	statusLabel := objects[8].(*widget.Label)
 
-	latencyLabel := objects[2].(*widget.Label)
-	lossLabel := objects[4].(*widget.Label)
+	// Column 1: Hop Number
+	hopNumLabel.SetText(fmt.Sprintf("%d", id+1))
 
+	// Column 2: IP Address
+	ipLabel.SetText(hop.IP)
+
+	// Column 3: Latency
 	if hop.AvgLatency > 0 {
 		latencyLabel.SetText(fmt.Sprintf("%.2f ms", hop.AvgLatency))
 	} else {
 		latencyLabel.SetText("N/A")
 	}
 
+	// Column 4: Packet Loss
 	if hop.LossPercent > 0 {
 		lossLabel.SetText(fmt.Sprintf("%.1f%%", hop.LossPercent))
 	} else {
 		lossLabel.SetText("0%")
 	}
+
+	// Column 5: Status (computed dynamically)
+	status := vm.computeStatus(hop)
+	statusLabel.SetText(status)
+}
+
+// computeStatus determines the status of a hop based on its metrics
+func (vm *VisualMTR) computeStatus(hop network.NetworkHop) string {
+	if hop.AvgLatency > 0 {
+		return "Active"
+	}
+	if hop.IP == "" {
+		return "Unknown"
+	}
+	return "Timeout"
 }
 
 func (vm *VisualMTR) onStart() {
@@ -205,10 +259,12 @@ func (vm *VisualMTR) onStart() {
 		if err != nil {
 			// TODO: Show error dialog
 			fmt.Printf("Error starting scanner: %v\n", err)
-			// Reset UI state on error
-			vm.startButton.Enable()
-			vm.hostnameEntry.Enable()
-			vm.stopButton.Disable()
+			// Reset UI state on error - must use fyne.Do() from goroutine
+			fyne.Do(func() {
+				vm.startButton.Enable()
+				vm.hostnameEntry.Enable()
+				vm.stopButton.Disable()
+			})
 			// Clear scanner reference
 			vm.hopsMutex.Lock()
 			vm.scanner = nil
@@ -272,8 +328,11 @@ func (vm *VisualMTR) handleUpdates() {
 		vm.hops[update.Index] = update.Hop
 		vm.hopsMutex.Unlock()
 
-		// Update UI on main thread (Fyne handles thread safety)
-		vm.hopList.Refresh()
+		// Update UI on main thread using fyne.Do()
+		// Since Fyne v2.6.0, all UI updates from goroutines must use fyne.Do()
+		fyne.Do(func() {
+			vm.hopList.Refresh()
+		})
 	}
 }
 

@@ -42,8 +42,8 @@ func NewScanner(hostname string) *Scanner {
 // 2. Start continuous pinging of all hops in parallel
 // 3. Send updates via the Updates() channel
 func (s *Scanner) Start() error {
-	// Perform traceroute to discover all hops
-	hops, err := performTraceroute(s.hostname)
+	// Perform traceroute to discover all hops, sending them in real-time via updates channel
+	hops, err := performTraceroute(s.hostname, s.updates, s.ctx)
 	if err != nil {
 		return err
 	}
@@ -143,9 +143,18 @@ func (s *Scanner) pingAllHops() {
 	// }
 }
 
+func pingHop(ip string) (float64, float64) {
+	// TODO: Implement actual ICMP ping logic here
+	// Example:
+	// latency, loss := pingHop(hop.IP)
+	// return latency, loss
+	return 0, 0
+}
+
 // performTraceroute performs a traceroute to the target hostname
+// Sends hops to the updates channel as they're discovered (for real-time UI updates)
 // Returns a slice of NetworkHop with IP addresses populated
-func performTraceroute(hostname string) ([]NetworkHop, error) {
+func performTraceroute(hostname string, updates chan<- HopUpdate, ctx context.Context) ([]NetworkHop, error) {
 	// Resolve the hostname to an IP address
 	dstAddr, err := net.ResolveIPAddr("ip", hostname)
 	if err != nil {
@@ -233,8 +242,19 @@ func performTraceroute(hostname string) ([]NetworkHop, error) {
 			// Extract IP from peerAddr (format: "ip:port" or just "ip")
 			hopIP := extractIPFromAddr(peerAddr)
 			fmt.Printf("%d\t%s\t%d\t%.2fms\n", ttl, hopIP, reply.Seq, elapsed.Seconds()*1000)
-			hops = append(hops, NetworkHop{IP: hopIP, AvgLatency: elapsed.Seconds() * 1000, LossPercent: 0})
+			hop := NetworkHop{IP: hopIP, AvgLatency: elapsed.Seconds() * 1000, LossPercent: 0}
+			hops = append(hops, hop)
 			log.Printf("[DEBUG] Added final hop: IP=%s, Latency=%.2fms\n", hopIP, elapsed.Seconds()*1000)
+
+			// Send hop to UI in real-time
+			hopIndex := len(hops) - 1
+			select {
+			case updates <- HopUpdate{Index: hopIndex, Hop: hop}:
+				log.Printf("[DEBUG] Sent hop %d to UI: IP=%s\n", hopIndex+1, hopIP)
+			case <-ctx.Done():
+				return hops, nil
+			}
+
 			// Destination reached, traceroute complete
 			destinationReached = true
 
@@ -242,9 +262,20 @@ func performTraceroute(hostname string) ([]NetworkHop, error) {
 			// Extract IP from peerAddr (format: "ip:port" or just "ip")
 			hopIP := extractIPFromAddr(peerAddr)
 			fmt.Printf("%d\t%s\t%d\t%.2fms\n", ttl, hopIP, ttl, elapsed.Seconds()*1000)
-			hops = append(hops, NetworkHop{IP: hopIP, AvgLatency: elapsed.Seconds() * 1000, LossPercent: 0})
+			hop := NetworkHop{IP: hopIP, AvgLatency: elapsed.Seconds() * 1000, LossPercent: 0}
+			hops = append(hops, hop)
 			log.Printf("[DEBUG] TTL=%d: Received TimeExceeded from %s (%.2fms)\n", ttl, hopIP, elapsed.Seconds()*1000)
 			log.Printf("[DEBUG] Added hop: IP=%s, Latency=%.2fms\n", hopIP, elapsed.Seconds()*1000)
+
+			// Send hop to UI in real-time
+			hopIndex := len(hops) - 1
+			select {
+			case updates <- HopUpdate{Index: hopIndex, Hop: hop}:
+				log.Printf("[DEBUG] Sent hop %d to UI: IP=%s\n", hopIndex+1, hopIP)
+			case <-ctx.Done():
+				return hops, nil
+			}
+
 			// Continue to next TTL
 			continue
 		default:
