@@ -10,6 +10,7 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/widget"
 	"github.com/afroash/visual-mtr/network"
+	"github.com/afroash/visual-mtr/ui"
 )
 
 type VisualMTR struct {
@@ -77,6 +78,8 @@ func (vm *VisualMTR) setupUI() {
 		widget.NewLabel("Loss"),
 		widget.NewLabel("  "),
 		widget.NewLabel("Status"),
+		widget.NewLabel("  "),
+		widget.NewLabel("Latency Graph"),
 	)
 	headerTextStyle := fyne.TextStyle{Bold: true}
 	for _, obj := range header.Objects {
@@ -140,7 +143,7 @@ func (vm *VisualMTR) hopListLength() int {
 }
 
 func (vm *VisualMTR) hopListCreateItem() fyne.CanvasObject {
-	// Create table-like layout with 5 columns: Hop#, IP, Latency, Loss, Status
+	// Create table-like layout with 6 columns: Hop#, IP, Latency, Loss, Status, Graph
 	hopNumLabel := widget.NewLabel("")
 	hopNumLabel.TextStyle = fyne.TextStyle{Bold: true}
 
@@ -151,8 +154,11 @@ func (vm *VisualMTR) hopListCreateItem() fyne.CanvasObject {
 	lossLabel := widget.NewLabel("")
 	statusLabel := widget.NewLabel("")
 
+	// Create the latency graph widget
+	graph := ui.NewLatencyGraph()
+
 	// Use HBox with proper spacing for table-like appearance
-	// Structure: [Hop#, IP, Latency, Loss, Status]
+	// Structure: [Hop#, IP, Latency, Loss, Status, Graph]
 	return container.NewHBox(
 		hopNumLabel,
 		widget.NewLabel("  "), // Spacer
@@ -163,6 +169,8 @@ func (vm *VisualMTR) hopListCreateItem() fyne.CanvasObject {
 		lossLabel,
 		widget.NewLabel("  "), // Spacer
 		statusLabel,
+		widget.NewLabel("  "), // Spacer
+		graph,
 	)
 }
 
@@ -188,16 +196,17 @@ func (vm *VisualMTR) hopListUpdateItem(id widget.ListItemID, obj fyne.CanvasObje
 	// Safely convert to []fyne.CanvasObject with type assertion check
 	objectsInterface := objectsField.Interface()
 	objects, ok := objectsInterface.([]fyne.CanvasObject)
-	if !ok || len(objects) < 9 {
+	if !ok || len(objects) < 11 {
 		return
 	}
 
-	// Objects structure: [hopNumLabel, spacer, ipLabel, spacer, latencyLabel, spacer, lossLabel, spacer, statusLabel]
+	// Objects structure: [hopNumLabel, spacer, ipLabel, spacer, latencyLabel, spacer, lossLabel, spacer, statusLabel, spacer, graph]
 	hopNumLabel := objects[0].(*widget.Label)
 	ipLabel := objects[2].(*widget.Label)
 	latencyLabel := objects[4].(*widget.Label)
 	lossLabel := objects[6].(*widget.Label)
 	statusLabel := objects[8].(*widget.Label)
+	graph := objects[10].(*ui.LatencyGraph)
 
 	// Column 1: Hop Number
 	hopNumLabel.SetText(fmt.Sprintf("%d", id+1))
@@ -222,6 +231,9 @@ func (vm *VisualMTR) hopListUpdateItem(id widget.ListItemID, obj fyne.CanvasObje
 	// Column 5: Status (computed dynamically)
 	status := vm.computeStatus(hop)
 	statusLabel.SetText(status)
+
+	// Column 6: Latency Graph - update with history data
+	graph.SetData(hop.LatencyHistory)
 }
 
 // computeStatus determines the status of a hop based on its metrics

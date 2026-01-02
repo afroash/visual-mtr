@@ -58,11 +58,11 @@ func (s *Scanner) Start() error {
 	}
 	s.conn = conn
 
-	log.Printf("[DEBUG] Traceroute discovered %d hops, starting monitor loop\n", len(s.hops))
+	log.Printf("[DEBUG] Traceroute discovered %d hops, starting PING loop\n", len(s.hops))
 
 	// Start the monitoring loop if we have hops
 	if len(s.hops) > 0 {
-		log.Printf("[DEBUG] Starting monitor loop for continuous ping updates\n")
+		log.Printf("[DEBUG] Starting PING loop for continuous ping updates\n")
 		go s.monitorLoop()
 	}
 
@@ -122,33 +122,130 @@ func (s *Scanner) monitorLoop() {
 }
 
 // pingAllHops pings all hops in parallel and sends updates
-// TODO: Implement actual ICMP ping logic here
 func (s *Scanner) pingAllHops() {
-	// TODO: For each hop in s.hops:
-	// 1. Send ICMP ping packets
-	// 2. Calculate average latency
-	// 3. Calculate packet loss percentage
-	// 4. Send update via s.updates channel
+	// Check if the hops are empty
+	if len(s.hops) == 0 {
+		return
+	}
 
-	// Placeholder: This is where you'll implement the actual ping logic
-	// Example structure:
-	// for i, hop := range s.hops {
-	//     latency, loss := pingHop(hop.IP)
-	//     updatedHop := NetworkHop{
-	//         IP:          hop.IP,
-	//         AvgLatency:  latency,
-	//         LossPercent: loss,
-	//     }
-	//     s.updates <- HopUpdate{Index: i, Hop: updatedHop}
-	// }
+	for i, hop := range s.hops {
+		latency, loss := s.pingHop(hop.IP)
+
+		// Build updated latency history (rolling window of last MaxLatencyHistory samples)
+		newHistory := make([]float64, 0, MaxLatencyHistory)
+		if len(hop.LatencyHistory) > 0 {
+			// Copy existing history
+			if len(hop.LatencyHistory) >= MaxLatencyHistory {
+				// Take last (MaxLatencyHistory-1) elements to make room for new one
+				newHistory = append(newHistory, hop.LatencyHistory[1:]...)
+			} else {
+				newHistory = append(newHistory, hop.LatencyHistory...)
+			}
+		}
+		// Append new latency (use -1 to indicate timeout/no response)
+		if latency > 0 {
+			newHistory = append(newHistory, latency)
+		} else {
+			newHistory = append(newHistory, -1) // -1 indicates timeout
+		}
+
+		// Calculate average from valid latencies in history
+		avgLatency := calculateAverageLatency(newHistory)
+
+		updatedHop := NetworkHop{
+			IP:             hop.IP,
+			AvgLatency:     avgLatency,
+			LossPercent:    loss,
+			LatencyHistory: newHistory,
+		}
+
+		// Update local hop data
+		s.hops[i] = updatedHop
+
+		s.updates <- HopUpdate{Index: i, Hop: updatedHop}
+	}
 }
 
-func pingHop(ip string) (float64, float64) {
+// calculateAverageLatency calculates average from valid latency values (ignoring -1 timeouts)
+func calculateAverageLatency(history []float64) float64 {
+	if len(history) == 0 {
+		return 0
+	}
+	var sum float64
+	var count int
+	for _, lat := range history {
+		if lat > 0 {
+			sum += lat
+			count++
+		}
+	}
+	if count == 0 {
+		return 0
+	}
+	return sum / float64(count)
+}
+
+func (s *Scanner) pingHop(ip string) (float64, float64) {
 	// TODO: Implement actual ICMP ping logic here
-	// Example:
-	// latency, loss := pingHop(hop.IP)
-	// return latency, loss
-	return 0, 0
+	startTime := time.Now()
+
+	log.Printf("[DEBUG] Sending PING packet to %s\n", ip)
+
+	// Create ICMP Message. Type will be Echo Request
+	msg := icmp.Message{
+		Type: ipv4.ICMPTypeEcho,
+		Code: 0,
+		Body: &icmp.Echo{
+			ID:   os.Getpid() % 0xFFFF,
+			Seq:  1,
+			Data: []byte("HELLO-PING"),
+		},
+	}
+
+	// Marshal the message
+	msgBytes, err := msg.Marshal(nil)
+	if err != nil {
+		log.Fatalf("Failed to marshal message: %v", err)
+	}
+
+	// Send the message
+	if _, err := s.conn.WriteTo(msgBytes, &net.IPAddr{IP: net.ParseIP(ip)}); err != nil {
+		log.Fatalf("Failed to send message: %v", err)
+	}
+	log.Printf("[DEBUG] Sent PING packet to %s (ID=%d, Seq=%d)\n", ip, msg.Body.(*icmp.Echo).ID, msg.Body.(*icmp.Echo).Seq)
+
+	// Receive the response
+	buf := make([]byte, 1500) // MTU size
+	s.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+
+	n, peerAddr, err := s.conn.ReadFrom(buf)
+	if err != nil {
+		log.Printf("[DEBUG] PING to %s: Timeout (no response within 3 seconds)\n", ip)
+		return 0, 0
+	}
+
+	elapsed := time.Since(startTime)
+	log.Printf("[DEBUG] Received response from %s (%.2fms)\n", peerAddr.String(), elapsed.Seconds()*1000)
+
+	// Unmarshal the response
+	recvMsg, err := icmp.ParseMessage(1, buf[:n]) // 1 for ICMPv4
+	if err != nil {
+		log.Printf("[DEBUG] PING to %s: Failed to parse response: %v\n", ip, err)
+		return 0, 0
+	}
+	log.Printf("[DEBUG] PING to %s: Parsed ICMP message type: %v\n", ip, recvMsg.Type)
+
+	// Handle the response and return the latency and loss percentage
+	switch recvMsg.Type {
+	case ipv4.ICMPTypeEchoReply:
+		return elapsed.Seconds() * 1000, 0
+	case ipv4.ICMPTypeTimeExceeded:
+		return 0, 100
+	case ipv4.ICMPTypeDestinationUnreachable:
+		return 0, 100
+	default:
+		return 0, 0
+	}
 }
 
 // performTraceroute performs a traceroute to the target hostname
