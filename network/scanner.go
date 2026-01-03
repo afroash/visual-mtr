@@ -13,11 +13,24 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
+// ScannerStatus represents the current state of the scanner
+type ScannerStatus string
+
+const (
+	StatusIdle      ScannerStatus = "Ready"
+	StatusResolving ScannerStatus = "Resolving hostname..."
+	StatusTracing   ScannerStatus = "Tracing route..."
+	StatusPinging   ScannerStatus = "Monitoring hops..."
+	StatusStopped   ScannerStatus = "Stopped"
+	StatusError     ScannerStatus = "Error"
+)
+
 // Scanner manages the network path scanning operations
 type Scanner struct {
 	hostname   string
 	hops       []NetworkHop
 	updates    chan HopUpdate
+	status     chan ScannerStatus
 	ctx        context.Context
 	cancel     context.CancelFunc
 	conn       *icmp.PacketConn // Connection for ICMP operations
@@ -31,6 +44,7 @@ func NewScanner(hostname string) *Scanner {
 		hostname: hostname,
 		hops:     make([]NetworkHop, 0),
 		updates:  make(chan HopUpdate, 100),
+		status:   make(chan ScannerStatus, 10),
 		ctx:      ctx,
 		cancel:   cancel,
 	}
@@ -42,9 +56,13 @@ func NewScanner(hostname string) *Scanner {
 // 2. Start continuous pinging of all hops in parallel
 // 3. Send updates via the Updates() channel
 func (s *Scanner) Start() error {
+	// Send tracing status
+	s.sendStatus(StatusTracing)
+
 	// Perform traceroute to discover all hops, sending them in real-time via updates channel
 	hops, err := performTraceroute(s.hostname, s.updates, s.ctx)
 	if err != nil {
+		s.sendStatus(StatusError)
 		return err
 	}
 
@@ -54,6 +72,7 @@ func (s *Scanner) Start() error {
 	// Create ICMP connection for continuous monitoring
 	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
 	if err != nil {
+		s.sendStatus(StatusError)
 		return fmt.Errorf("failed to create ICMP connection for monitoring: %v", err)
 	}
 	s.conn = conn
@@ -63,10 +82,20 @@ func (s *Scanner) Start() error {
 	// Start the monitoring loop if we have hops
 	if len(s.hops) > 0 {
 		log.Printf("[DEBUG] Starting PING loop for continuous ping updates\n")
+		s.sendStatus(StatusPinging)
 		go s.monitorLoop()
 	}
 
 	return nil
+}
+
+// sendStatus sends a status update to the status channel (non-blocking)
+func (s *Scanner) sendStatus(status ScannerStatus) {
+	select {
+	case s.status <- status:
+	default:
+		// Channel full, skip update
+	}
 }
 
 // extractIPFromAddr extracts the IP address from a net.Addr
@@ -81,6 +110,12 @@ func extractIPFromAddr(addr net.Addr) string {
 	return host
 }
 
+// extractDNSfromIP extracts the DNS name /cname for a host found in trace.
+func extractDNSfromIP(addr net.Addr) string {
+	cname, _ := net.LookupAddr(addr.String())
+	return cname[0]
+}
+
 // Stop halts the scanning process
 func (s *Scanner) Stop() {
 	s.cancel()
@@ -88,16 +123,23 @@ func (s *Scanner) Stop() {
 		s.conn.Close()
 		s.conn = nil
 	}
-	// Safely close the updates channel (only once)
+	// Safely close the channels (only once)
 	if !s.stopCalled {
 		s.stopCalled = true
+		s.sendStatus(StatusStopped)
 		close(s.updates)
+		close(s.status)
 	}
 }
 
 // Updates returns the channel that emits hop updates
 func (s *Scanner) Updates() <-chan HopUpdate {
 	return s.updates
+}
+
+// Status returns the channel that emits status updates
+func (s *Scanner) Status() <-chan ScannerStatus {
+	return s.status
 }
 
 // GetHops returns the current list of hops

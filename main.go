@@ -19,6 +19,7 @@ type VisualMTR struct {
 	hostnameEntry *widget.Entry
 	startButton   *widget.Button
 	stopButton    *widget.Button
+	statusLabel   *widget.Label
 	hopList       *widget.List
 	scanner       *network.Scanner
 	hops          []network.NetworkHop
@@ -60,6 +61,19 @@ func (vm *VisualMTR) setupUI() {
 		container.NewHBox(vm.startButton, vm.stopButton),
 		vm.hostnameEntry)
 
+	// Status label - shows current operation state
+	vm.statusLabel = widget.NewLabel("Ready - Enter a hostname and click Start")
+	vm.statusLabel.TextStyle = fyne.TextStyle{Italic: true}
+
+	// Status bar container with some padding
+	statusBar := container.NewHBox(
+		widget.NewLabel("Status:"),
+		vm.statusLabel,
+	)
+
+	// Combine top bar and status into header section
+	topSection := container.NewVBox(topBar, statusBar)
+
 	// Hop list with custom data binding
 	vm.hopList = widget.NewList(
 		vm.hopListLength,
@@ -96,7 +110,7 @@ func (vm *VisualMTR) setupUI() {
 	listWithHeader := container.NewBorder(header, nil, nil, nil, scrollContainer)
 
 	// Main layout
-	content := container.NewBorder(topBar, nil, nil, nil, listWithHeader)
+	content := container.NewBorder(topSection, nil, nil, nil, listWithHeader)
 	vm.window.SetContent(content)
 }
 
@@ -250,7 +264,7 @@ func (vm *VisualMTR) computeStatus(hop network.NetworkHop) string {
 func (vm *VisualMTR) onStart() {
 	hostname := vm.hostnameEntry.Text
 	if hostname == "" {
-		// TODO: Show error dialog
+		vm.statusLabel.SetText("Error: Please enter a hostname")
 		return
 	}
 
@@ -258,6 +272,7 @@ func (vm *VisualMTR) onStart() {
 	vm.startButton.Disable()
 	vm.hostnameEntry.Disable()
 	vm.stopButton.Enable()
+	vm.statusLabel.SetText("Starting...")
 
 	// Create new scanner with mutex protection
 	vm.hopsMutex.Lock()
@@ -269,13 +284,13 @@ func (vm *VisualMTR) onStart() {
 	go func() {
 		err := scanner.Start()
 		if err != nil {
-			// TODO: Show error dialog
 			fmt.Printf("Error starting scanner: %v\n", err)
 			// Reset UI state on error - must use fyne.Do() from goroutine
 			fyne.Do(func() {
 				vm.startButton.Enable()
 				vm.hostnameEntry.Enable()
 				vm.stopButton.Disable()
+				vm.statusLabel.SetText(fmt.Sprintf("Error: %v", err))
 			})
 			// Clear scanner reference
 			vm.hopsMutex.Lock()
@@ -285,8 +300,9 @@ func (vm *VisualMTR) onStart() {
 		}
 	}()
 
-	// Start update handler goroutine
+	// Start update handler goroutines
 	go vm.handleUpdates()
+	go vm.handleStatus()
 }
 
 func (vm *VisualMTR) onStop() {
@@ -303,6 +319,7 @@ func (vm *VisualMTR) onStop() {
 	vm.startButton.Enable()
 	vm.hostnameEntry.Enable()
 	vm.stopButton.Disable()
+	vm.statusLabel.SetText("Stopped - Enter a hostname and click Start")
 
 	// Clear hops
 	vm.hopsMutex.Lock()
@@ -345,6 +362,46 @@ func (vm *VisualMTR) handleUpdates() {
 		fyne.Do(func() {
 			vm.hopList.Refresh()
 		})
+	}
+}
+
+// handleStatus processes status updates from the scanner and updates the status label
+func (vm *VisualMTR) handleStatus() {
+	vm.hopsMutex.RLock()
+	scanner := vm.scanner
+	vm.hopsMutex.RUnlock()
+
+	if scanner == nil {
+		return
+	}
+
+	statusChan := scanner.Status()
+
+	for status := range statusChan {
+		statusText := vm.formatStatus(status)
+		fyne.Do(func() {
+			vm.statusLabel.SetText(statusText)
+		})
+	}
+}
+
+// formatStatus converts a ScannerStatus to a user-friendly message
+func (vm *VisualMTR) formatStatus(status network.ScannerStatus) string {
+	vm.hopsMutex.RLock()
+	hopCount := len(vm.hops)
+	vm.hopsMutex.RUnlock()
+
+	switch status {
+	case network.StatusTracing:
+		return "🔍 Tracing route to destination..."
+	case network.StatusPinging:
+		return fmt.Sprintf("📡 Monitoring %d hops...", hopCount)
+	case network.StatusStopped:
+		return "⏹ Stopped"
+	case network.StatusError:
+		return "❌ Error occurred"
+	default:
+		return string(status)
 	}
 }
 
